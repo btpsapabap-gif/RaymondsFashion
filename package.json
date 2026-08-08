@@ -1,0 +1,29 @@
+{
+  "name": "raymond-fashion-mcp",
+  "version": "1.0.0",
+  "description": "Intent-based Raymond fashion shopping MCP server - triggers automatically inside Claude, ChatGPT, and any MCP-compatible AI assistant",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "seed": "node --loader tsx supabase/seed.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@supabase/supabase-js": "^2.45.4",
+    "express": "^4.21.2",
+    "zod": "^3.23.8",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

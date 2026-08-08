@@ -1,0 +1,126 @@
+openapi: 3.1.0
+info:
+  title: Raymond Fashion Shopping API
+  description: >
+    REST fallback for platforms that use OpenAPI-based "Actions" instead of
+    native MCP (e.g. a ChatGPT Custom GPT built without Developer Mode).
+    Points at the same backend logic as the MCP server. Prefer connecting
+    via MCP directly wherever it's supported.
+  version: "1.0.0"
+servers:
+  - url: https://your-deployed-domain.com/api
+paths:
+  /categories:
+    get:
+      operationId: browseCategories
+      summary: List all Raymond fashion collections
+      responses:
+        "200":
+          description: List of categories
+  /products/search:
+    get:
+      operationId: searchProducts
+      summary: Search products by query, category, color, size, price, or brand
+      parameters:
+        - name: query
+          in: query
+          schema: { type: string }
+        - name: category_slug
+          in: query
+          schema: { type: string }
+        - name: color
+          in: query
+          schema: { type: string }
+        - name: size
+          in: query
+          schema: { type: string }
+        - name: min_price
+          in: query
+          schema: { type: number }
+        - name: max_price
+          in: query
+          schema: { type: number }
+        - name: brand
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Matching products with variants
+  /products/{product_id}:
+    get:
+      operationId: getProductDetails
+      summary: Get full details and size variants for a product
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Product details
+  /products/{product_id}/stock:
+    get:
+      operationId: checkStock
+      summary: Check size/stock availability for a product
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: size
+          in: query
+          schema: { type: string }
+        - name: quantity
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Stock availability
+  /orders:
+    post:
+      operationId: createOrder
+      summary: Hold stock and create a pending order with discount applied
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items, user_id]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [variant_id, quantity]
+                    properties:
+                      variant_id: { type: string, format: uuid }
+                      quantity: { type: integer }
+                user_id: { type: string, format: uuid }
+                shipping_address: { type: object }
+                discount_code: { type: string }
+                source_client: { type: string }
+      responses:
+        "200":
+          description: Pending order created
+  /orders/{order_id}/confirm:
+    post:
+      operationId: confirmPayment
+      summary: Confirm payment and finalize an order
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_ref]
+              properties:
+                payment_ref: { type: string }
+      responses:
+        "200":
+          description: Order confirmed
