@@ -8,7 +8,7 @@ create extension if not exists pgcrypto;
 
 -- ---------- CATEGORIES ----------
 -- Mirrors https://myraymond.com/collections
-create table categories (
+create table if not exists categories (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,          -- e.g. "Formal Shirts"
   slug text not null unique,          -- e.g. "formal-shirts"
@@ -17,7 +17,7 @@ create table categories (
 );
 
 -- ---------- PRODUCTS ----------
-create table products (
+create table if not exists products (
   id uuid primary key default gen_random_uuid(),
   category_id uuid references categories(id) on delete cascade,
   brand text not null default 'Raymond',   -- Raymond | Park Avenue | Parx | Colorplus etc.
@@ -38,11 +38,11 @@ create table products (
   created_at timestamptz default now()
 );
 
-create index idx_products_category on products (category_id);
-create index idx_products_name on products using gin (to_tsvector('english', name));
+create index if not exists idx_products_category on products (category_id);
+create index if not exists idx_products_name on products using gin (to_tsvector('english', name));
 
 -- ---------- PRODUCT VARIANTS (size-level inventory) ----------
-create table product_variants (
+create table if not exists product_variants (
   id uuid primary key default gen_random_uuid(),
   product_id uuid references products(id) on delete cascade,
   size text not null,                      -- "S","M","L","XL","2XL" or waist "32","34" etc.
@@ -52,10 +52,10 @@ create table product_variants (
   unique (product_id, size)
 );
 
-create index idx_variants_product on product_variants (product_id);
+create index if not exists idx_variants_product on product_variants (product_id);
 
 -- ---------- DISCOUNTS ----------
-create table discounts (
+create table if not exists discounts (
   id uuid primary key default gen_random_uuid(),
   code text unique,                        -- null = auto-applied instant discount
   description text,
@@ -68,20 +68,27 @@ create table discounts (
   is_active boolean default true
 );
 
--- ---------- USERS (shoppers; auth handled via Supabase Auth) ----------
-create table app_users (
-  id uuid primary key references auth.users(id) on delete cascade,
+-- ---------- CUSTOMERS (guest-checkout identity, keyed by email) ----------
+-- Deliberately NOT tied to Supabase Auth: a chat-driven checkout shouldn't
+-- require the shopper to already have a logged-in session. create_order
+-- looks up (or creates) a row here by email, the same way a normal
+-- guest-checkout e-commerce flow would. If you later add real accounts
+-- (Supabase Auth / social login), add an optional `auth_user_id uuid
+-- references auth.users(id)` column here and backfill it on login —
+-- orders keep working unchanged either way.
+create table if not exists customers (
+  id uuid primary key default gen_random_uuid(),
+  email text not null unique,
   full_name text,
   phone text,
-  email text,
   default_address jsonb,
   created_at timestamptz default now()
 );
 
 -- ---------- ORDERS ----------
-create table orders (
+create table if not exists orders (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid references app_users(id),
+  customer_id uuid references customers(id),
   items jsonb not null,                    -- [{variant_id, product_id, size, quantity, unit_price}]
   num_items int not null,
   base_amount numeric(10,2) not null,
@@ -92,35 +99,41 @@ create table orders (
   shipping_address jsonb,
   source text default 'mcp',               -- mcp | web | app
   source_client text,                      -- e.g. "claude", "chatgpt"
-  payment_ref text,
+  payment_provider text default 'razorpay',
+  payment_link_id text,                    -- Razorpay payment_link id (plink_...)
+  payment_link_url text,                   -- short_url the shopper actually pays on
+  payment_ref text,                        -- Razorpay payment id (pay_...) once paid
   hold_expires_at timestamptz,
   created_at timestamptz default now(),
   confirmed_at timestamptz
 );
 
+create index if not exists idx_orders_payment_link on orders (payment_link_id);
+
 -- =========================================================
 -- ROW LEVEL SECURITY
 -- =========================================================
+-- orders and customers are written exclusively by this MCP server, which
+-- authenticates to Supabase with the service role key (bypasses RLS by
+-- design — see src/db.ts). Enabling RLS with no permissive policy here
+-- means anon/authenticated clients get zero direct access, which is the
+-- right default for a guest-checkout table with no login session behind
+-- it yet. If you add a customer-facing web/app login later, add policies
+-- here scoped to whatever identity column you introduce (e.g. an
+-- auth_user_id column on customers, see note above).
 alter table orders enable row level security;
-alter table app_users enable row level security;
-
-create policy "Users read own orders"
-  on orders for select
-  using (auth.uid() = user_id);
-
-create policy "Users create own orders"
-  on orders for insert
-  with check (auth.uid() = user_id);
-
-create policy "Users read own profile"
-  on app_users for select
-  using (auth.uid() = id);
+alter table customers enable row level security;
 
 -- Public read-only catalog data
 alter table categories enable row level security;
 alter table products enable row level security;
 alter table product_variants enable row level security;
 alter table discounts enable row level security;
+
+drop policy if exists "Public read categories" on categories;
+drop policy if exists "Public read products" on products;
+drop policy if exists "Public read variants" on product_variants;
+drop policy if exists "Public read active discounts" on discounts;
 
 create policy "Public read categories" on categories for select using (true);
 create policy "Public read products" on products for select using (true);

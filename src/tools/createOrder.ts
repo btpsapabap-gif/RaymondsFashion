@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { supabase } from "../db.js";
+import { createPaymentLink } from "../razorpay.js";
 
 const orderItemSchema = z.object({
   variant_id: z.string().uuid().describe("Product variant ID (specific size) from check_stock or search_products"),
@@ -8,7 +9,21 @@ const orderItemSchema = z.object({
 
 export const createOrderSchema = {
   items: z.array(orderItemSchema).min(1).describe("List of {variant_id, quantity} the user wants to buy"),
-  user_id: z.string().uuid().describe("Authenticated app user ID placing the order"),
+  customer_email: z
+    .string()
+    .email()
+    .describe(
+      "Shopper's email address. Always ask the user for this before calling create_order — it's how we " +
+        "identify or create their customer record, and it's where the Razorpay payment link and receipt are sent."
+    ),
+  customer_name: z
+    .string()
+    .optional()
+    .describe("Shopper's full name — used on the payment link and shipping label."),
+  customer_phone: z
+    .string()
+    .optional()
+    .describe("Shopper's phone number, e.g. '+919876543210' — used for Razorpay SMS payment reminders."),
   shipping_address: z
     .object({
       full_name: z.string(),
@@ -20,7 +35,7 @@ export const createOrderSchema = {
       phone: z.string(),
     })
     .optional()
-    .describe("Delivery address. Optional at hold time but required before confirm_payment in production."),
+    .describe("Delivery address. Optional at hold time but required before the order ships."),
   discount_code: z
     .string()
     .optional()
@@ -35,7 +50,9 @@ const HOLD_MINUTES = 15;
 
 export async function createOrder(args: {
   items: { variant_id: string; quantity: number }[];
-  user_id: string;
+  customer_email: string;
+  customer_name?: string;
+  customer_phone?: string;
   shipping_address?: Record<string, string>;
   discount_code?: string;
   source_client?: string;
@@ -68,7 +85,42 @@ export async function createOrder(args: {
     };
   }
 
-  // 2. Place a hold on each variant (increment held_quantity).
+  // 2. Resolve or create the customer record by email (guest checkout — no login required).
+  let customer: { id: string } | null = null;
+  const { data: existingCustomer, error: lookupErr } = await supabase
+    .from("customers")
+    .select("id")
+    .eq("email", args.customer_email)
+    .maybeSingle();
+  if (lookupErr) return { error: lookupErr.message };
+
+  if (existingCustomer) {
+    customer = existingCustomer;
+    // Keep name/phone fresh if the shopper supplied new ones this time.
+    if (args.customer_name || args.customer_phone) {
+      await supabase
+        .from("customers")
+        .update({
+          ...(args.customer_name ? { full_name: args.customer_name } : {}),
+          ...(args.customer_phone ? { phone: args.customer_phone } : {}),
+        })
+        .eq("id", customer.id);
+    }
+  } else {
+    const { data: newCustomer, error: insertErr } = await supabase
+      .from("customers")
+      .insert({
+        email: args.customer_email,
+        full_name: args.customer_name,
+        phone: args.customer_phone,
+      })
+      .select("id")
+      .single();
+    if (insertErr) return { error: insertErr.message };
+    customer = newCustomer;
+  }
+
+  // 3. Place a hold on each variant (increment held_quantity).
   for (const item of args.items) {
     const v = variants.find((x: any) => x.id === item.variant_id)!;
     const { error: holdErr } = await supabase
@@ -78,7 +130,7 @@ export async function createOrder(args: {
     if (holdErr) return { error: holdErr.message };
   }
 
-  // 3. Compute pricing.
+  // 4. Compute pricing.
   const orderItems = args.items.map((item) => {
     const v = variants.find((x: any) => x.id === item.variant_id)! as any;
     return {
@@ -92,7 +144,7 @@ export async function createOrder(args: {
   });
   const baseAmount = orderItems.reduce((sum, i) => sum + i.unit_price * i.quantity, 0);
 
-  // 4. Resolve discount — explicit code, else any active auto-apply (code IS NULL) discount.
+  // 5. Resolve discount — explicit code, else any active auto-apply (code IS NULL) discount.
   let discount = null;
   if (args.discount_code) {
     const { data } = await supabase
@@ -127,11 +179,11 @@ export async function createOrder(args: {
   const finalAmount = Math.max(baseAmount - discountAmount, 0);
   const holdExpiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000).toISOString();
 
-  // 5. Create the pending order record.
+  // 6. Create the pending order record.
   const { data: order, error: orderErr } = await supabase
     .from("orders")
     .insert({
-      user_id: args.user_id,
+      customer_id: customer.id,
       items: orderItems,
       num_items: orderItems.reduce((sum, i) => sum + i.quantity, 0),
       base_amount: baseAmount,
@@ -149,14 +201,48 @@ export async function createOrder(args: {
 
   if (orderErr) return { error: orderErr.message };
 
-  return {
-    order_id: order.id,
-    status: "pending",
-    items: orderItems,
-    base_amount: baseAmount,
-    discount_applied: discount ? { description: discount.description, amount: discountAmount } : null,
-    final_amount: finalAmount,
-    stock_held_for_minutes: HOLD_MINUTES,
-    next_step: "Call confirm_payment with this order_id once payment is completed on the checkout link.",
-  };
+  // 7. Generate the Razorpay payment link. If Razorpay isn't configured or the
+  // API call fails, the order still exists as a pending hold — surface the
+  // problem clearly instead of silently returning no way to pay.
+  try {
+    const paymentLink = await createPaymentLink({
+      amountInRupees: finalAmount,
+      description: `Raymond order ${order.id.slice(0, 8)} — ${orderItems.length} item(s)`,
+      customerName: args.customer_name,
+      customerEmail: args.customer_email,
+      customerPhone: args.customer_phone,
+      referenceId: order.id,
+    });
+
+    await supabase
+      .from("orders")
+      .update({ payment_link_id: paymentLink.id, payment_link_url: paymentLink.short_url })
+      .eq("id", order.id);
+
+    return {
+      order_id: order.id,
+      status: "pending",
+      items: orderItems,
+      base_amount: baseAmount,
+      discount_applied: discount ? { description: discount.description, amount: discountAmount } : null,
+      final_amount: finalAmount,
+      stock_held_for_minutes: HOLD_MINUTES,
+      payment_link: paymentLink.short_url,
+      next_step:
+        "Send the shopper this payment_link to pay via Razorpay. The order auto-confirms via webhook once " +
+        "paid — no need to call confirm_payment manually unless you're testing without a live webhook.",
+    };
+  } catch (err: any) {
+    return {
+      order_id: order.id,
+      status: "pending",
+      items: orderItems,
+      base_amount: baseAmount,
+      discount_applied: discount ? { description: discount.description, amount: discountAmount } : null,
+      final_amount: finalAmount,
+      stock_held_for_minutes: HOLD_MINUTES,
+      warning: `Order created and stock held, but the Razorpay payment link could not be generated: ${err.message}`,
+      next_step: "Fix the Razorpay configuration (RAZORPAY_KEY_ID/SECRET) and retry, or call confirm_payment manually once paid out-of-band.",
+    };
+  }
 }

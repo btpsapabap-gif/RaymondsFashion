@@ -79,14 +79,19 @@ paths:
   /orders:
     post:
       operationId: createOrder
-      summary: Hold stock and create a pending order with discount applied
+      summary: >
+        Hold stock, create/reuse a guest customer by email, apply any
+        eligible discount, and generate a Razorpay payment link. The
+        response's payment_link is what you hand back to the shopper — the
+        order confirms itself automatically once Razorpay's webhook reports
+        it paid, no separate confirm call needed in normal use.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [items, user_id]
+              required: [items, customer_email]
               properties:
                 items:
                   type: array
@@ -96,17 +101,23 @@ paths:
                     properties:
                       variant_id: { type: string, format: uuid }
                       quantity: { type: integer }
-                user_id: { type: string, format: uuid }
+                customer_email: { type: string, format: email }
+                customer_name: { type: string }
+                customer_phone: { type: string }
                 shipping_address: { type: object }
                 discount_code: { type: string }
                 source_client: { type: string }
       responses:
         "200":
-          description: Pending order created
+          description: Pending order created, includes payment_link to send the shopper
   /orders/{order_id}/confirm:
     post:
       operationId: confirmPayment
-      summary: Confirm payment and finalize an order
+      summary: >
+        Manually finalize an order. Not needed in normal use since orders
+        auto-confirm via the /webhooks/razorpay route once paid — this is
+        for local testing without a public webhook URL, or reconciling a
+        payment whose webhook didn't arrive.
       parameters:
         - name: order_id
           in: path
@@ -120,7 +131,9 @@ paths:
               type: object
               required: [payment_ref]
               properties:
-                payment_ref: { type: string }
+                payment_ref:
+                  type: string
+                  description: Razorpay payment id (starts "pay_")
       responses:
         "200":
           description: Order confirmed

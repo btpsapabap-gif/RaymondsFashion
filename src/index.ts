@@ -9,6 +9,18 @@ import { getProductDetails, getProductDetailsSchema } from "./tools/getProductDe
 import { checkStock, checkStockSchema } from "./tools/checkStock.js";
 import { createOrder, createOrderSchema } from "./tools/createOrder.js";
 import { confirmPayment, confirmPaymentSchema } from "./tools/confirmPayment.js";
+import { fulfillOrder } from "./lib/fulfillOrder.js";
+import { verifyWebhookSignature } from "./razorpay.js";
+
+// Express's json() body-parser normally discards the raw request bytes once
+// it's parsed them. The Razorpay webhook signature is computed over those
+// exact raw bytes, so we capture them here via the `verify` hook before
+// they're thrown away — req.body still gets the parsed JSON as usual.
+declare module "express-serve-static-core" {
+  interface Request {
+    rawBody?: string;
+  }
+}
 
 function buildServer() {
   const server = new McpServer({
@@ -53,17 +65,20 @@ function buildServer() {
 
   server.tool(
     "create_order",
-    "Hold the selected size variants and create a pending order with any applicable discount applied. " +
-      "Returns an order_id and final price. This does NOT charge the user yet — call confirm_payment after " +
-      "the payment link is completed.",
+    "Hold the selected size variants, create (or reuse) a guest customer record by email, apply any " +
+      "eligible discount, and generate a Razorpay payment link. Always ask the shopper for their email " +
+      "before calling this — no account or login is required. Returns an order_id and a payment_link the " +
+      "shopper pays on; send them that link. The order auto-confirms itself via Razorpay's webhook the " +
+      "moment they pay, so you don't need to call confirm_payment afterward.",
     createOrderSchema,
     async (args) => ({ content: [{ type: "text", text: JSON.stringify(await createOrder(args)) }] })
   );
 
   server.tool(
     "confirm_payment",
-    "Finalize a pending order after payment has been completed, converting held stock into a confirmed, " +
-      "shippable order.",
+    "Manually finalize a pending order. Not needed in normal use — orders already auto-confirm via the " +
+      "Razorpay webhook once paid. Only call this for local testing without a public webhook URL, or to " +
+      "reconcile a payment whose webhook notification didn't arrive.",
     confirmPaymentSchema,
     async (args) => ({ content: [{ type: "text", text: JSON.stringify(await confirmPayment(args)) }] })
   );
@@ -72,7 +87,45 @@ function buildServer() {
 }
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as express.Request).rawBody = buf.toString("utf8");
+    },
+  })
+);
+
+// Razorpay calls this the moment a Payment Link is paid. We verify the
+// signature against the raw body (captured above), then reuse the exact
+// same fulfillment logic the confirm_payment tool uses, so an order always
+// ends up in the same state regardless of which path confirmed it.
+app.post("/webhooks/razorpay", async (req, res) => {
+  const signature = req.headers["x-razorpay-signature"] as string | undefined;
+
+  if (!verifyWebhookSignature(req.rawBody ?? "", signature)) {
+    console.warn("Rejected Razorpay webhook: invalid or missing signature");
+    return res.status(400).json({ error: "Invalid webhook signature" });
+  }
+
+  const event = req.body;
+
+  if (event.event === "payment_link.paid") {
+    const orderId: string | undefined = event.payload?.payment_link?.entity?.reference_id;
+    const paymentId: string | undefined = event.payload?.payment?.entity?.id;
+
+    if (orderId && paymentId) {
+      const result = await fulfillOrder(orderId, paymentId);
+      if ((result as any).error && !(result as any).already_final) {
+        console.error("Webhook could not fulfill order", orderId, (result as any).error);
+      }
+    } else {
+      console.warn("payment_link.paid webhook missing reference_id or payment id", event.payload);
+    }
+  }
+
+  // Razorpay only needs a 2xx to stop retrying; it doesn't read the body.
+  res.json({ status: "ok" });
+});
 
 // Stateless mode: a fresh transport per request is the simplest, most robust
 // way to run on serverless platforms like Vercel. For high-throughput use,

@@ -50,6 +50,43 @@ category vocabulary the assistant sees matches what a shopper would recognize
 from the real site, and `product_url` on each row points back to the real
 collection page for that category.
 
+## Why checkout is guest/email-based, not login-gated
+
+The first version of this project required a pre-existing Supabase Auth
+`user_id` (a UUID) before `create_order` would work. In practice that meant
+a chat user had no way to actually buy anything — there was no signup flow,
+and asking someone to hand an assistant a raw internal UUID isn't a
+reasonable checkout experience.
+
+`create_order` now takes a `customer_email` instead. It looks up (or
+creates) a row in a dedicated `customers` table keyed by email —
+deliberately **not** wired to Supabase Auth. This mirrors how most
+e-commerce "guest checkout" flows work: no password, no session, no signup
+step, just an email so there's somewhere to send the receipt and payment
+link. If you later add real accounts, add an optional `auth_user_id`
+column to `customers` and backfill it on login; orders keep working
+unchanged either way.
+
+## Why payment confirmation happens over a webhook, not a tool call
+
+`confirm_payment` used to be the only way to mark an order paid — the
+assistant would have to somehow obtain a payment reference and call it
+manually. That's backwards: the assistant isn't present at the moment the
+shopper actually pays (they've left the chat to complete checkout on
+Razorpay's hosted page), so there's nothing for it to call at the right
+time.
+
+Instead, `create_order` generates a **Razorpay Payment Link**, and Razorpay
+itself notifies the server via a `payment_link.paid` webhook the instant
+payment succeeds — regardless of whether the assistant, or even the same
+conversation, is still around. `POST /webhooks/razorpay` verifies the
+request really came from Razorpay (HMAC signature check against
+`RAZORPAY_WEBHOOK_SECRET`) and then calls the same `fulfillOrder()`
+function the `confirm_payment` tool uses, so both paths always leave an
+order in an identical state. `confirm_payment` still exists as a manual
+escape hatch for local testing or webhook-delivery failures — it's just no
+longer the primary path.
+
 ## Extending this into a real, live catalog
 
 The seed data is illustrative (a handful of representative SKUs per

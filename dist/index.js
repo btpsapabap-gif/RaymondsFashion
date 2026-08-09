@@ -8,6 +8,8 @@ import { getProductDetails, getProductDetailsSchema } from "./tools/getProductDe
 import { checkStock, checkStockSchema } from "./tools/checkStock.js";
 import { createOrder, createOrderSchema } from "./tools/createOrder.js";
 import { confirmPayment, confirmPaymentSchema } from "./tools/confirmPayment.js";
+import { fulfillOrder } from "./lib/fulfillOrder.js";
+import { verifyWebhookSignature } from "./razorpay.js";
 function buildServer() {
     const server = new McpServer({
         name: "raymond-fashion-shopping",
@@ -24,15 +26,49 @@ function buildServer() {
         "with stock. Call this after search_products once the user has picked a specific product.", getProductDetailsSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await getProductDetails(args)) }] }));
     server.tool("check_stock", "Check live stock for a product, optionally narrowed to one size and quantity. Returns whether the " +
         "requested size/quantity is available, and suggests in-stock alternative sizes if not.", checkStockSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await checkStock(args)) }] }));
-    server.tool("create_order", "Hold the selected size variants and create a pending order with any applicable discount applied. " +
-        "Returns an order_id and final price. This does NOT charge the user yet — call confirm_payment after " +
-        "the payment link is completed.", createOrderSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await createOrder(args)) }] }));
-    server.tool("confirm_payment", "Finalize a pending order after payment has been completed, converting held stock into a confirmed, " +
-        "shippable order.", confirmPaymentSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await confirmPayment(args)) }] }));
+    server.tool("create_order", "Hold the selected size variants, create (or reuse) a guest customer record by email, apply any " +
+        "eligible discount, and generate a Razorpay payment link. Always ask the shopper for their email " +
+        "before calling this — no account or login is required. Returns an order_id and a payment_link the " +
+        "shopper pays on; send them that link. The order auto-confirms itself via Razorpay's webhook the " +
+        "moment they pay, so you don't need to call confirm_payment afterward.", createOrderSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await createOrder(args)) }] }));
+    server.tool("confirm_payment", "Manually finalize a pending order. Not needed in normal use — orders already auto-confirm via the " +
+        "Razorpay webhook once paid. Only call this for local testing without a public webhook URL, or to " +
+        "reconcile a payment whose webhook notification didn't arrive.", confirmPaymentSchema, async (args) => ({ content: [{ type: "text", text: JSON.stringify(await confirmPayment(args)) }] }));
     return server;
 }
 const app = express();
-app.use(express.json());
+app.use(express.json({
+    verify: (req, _res, buf) => {
+        req.rawBody = buf.toString("utf8");
+    },
+}));
+// Razorpay calls this the moment a Payment Link is paid. We verify the
+// signature against the raw body (captured above), then reuse the exact
+// same fulfillment logic the confirm_payment tool uses, so an order always
+// ends up in the same state regardless of which path confirmed it.
+app.post("/webhooks/razorpay", async (req, res) => {
+    const signature = req.headers["x-razorpay-signature"];
+    if (!verifyWebhookSignature(req.rawBody ?? "", signature)) {
+        console.warn("Rejected Razorpay webhook: invalid or missing signature");
+        return res.status(400).json({ error: "Invalid webhook signature" });
+    }
+    const event = req.body;
+    if (event.event === "payment_link.paid") {
+        const orderId = event.payload?.payment_link?.entity?.reference_id;
+        const paymentId = event.payload?.payment?.entity?.id;
+        if (orderId && paymentId) {
+            const result = await fulfillOrder(orderId, paymentId);
+            if (result.error && !result.already_final) {
+                console.error("Webhook could not fulfill order", orderId, result.error);
+            }
+        }
+        else {
+            console.warn("payment_link.paid webhook missing reference_id or payment id", event.payload);
+        }
+    }
+    // Razorpay only needs a 2xx to stop retrying; it doesn't read the body.
+    res.json({ status: "ok" });
+});
 // Stateless mode: a fresh transport per request is the simplest, most robust
 // way to run on serverless platforms like Vercel. For high-throughput use,
 // switch to session-based transport with an event store (see MCP SDK docs).

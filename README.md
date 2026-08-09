@@ -29,17 +29,20 @@ not a Claude-only or ChatGPT-only mechanism.
 ```
 fashion-mcp/
 ├── src/
-│   ├── index.ts                    # MCP server: registers all 6 tools, HTTP transport
+│   ├── index.ts                    # MCP server: registers all 6 tools, HTTP transport, Razorpay webhook
 │   ├── db.ts                       # Supabase client
+│   ├── razorpay.ts                 # Razorpay Payment Links API client + webhook signature verification
+│   ├── lib/
+│   │   └── fulfillOrder.ts         # Shared "mark paid + deduct stock" logic (used by tool AND webhook)
 │   └── tools/
 │       ├── browseCategories.ts     # browse_categories
 │       ├── searchProducts.ts       # search_products
 │       ├── getProductDetails.ts    # get_product_details
 │       ├── checkStock.ts           # check_stock
-│       ├── createOrder.ts          # create_order (holds stock + applies discount)
-│       └── confirmPayment.ts       # confirm_payment (finalizes order)
+│       ├── createOrder.ts          # create_order (holds stock, resolves customer by email, creates payment link)
+│       └── confirmPayment.ts       # confirm_payment (manual/testing override — see below)
 ├── supabase/
-│   ├── schema.sql                  # Full DB schema: categories, products, variants, orders, discounts, RLS
+│   ├── schema.sql                  # Full DB schema: categories, products, variants, customers, orders, discounts, RLS
 │   └── seed.sql                    # Sample data: 10 Raymond collections, ~20 products, sizes/stock, discounts
 ├── openapi/
 │   └── actions.yaml                # Fallback spec for ChatGPT Custom GPT "Actions" (non-MCP path)
@@ -57,8 +60,48 @@ fashion-mcp/
 | `search_products` | Finds products by free-text query, category, color, size, price range, or brand — the entry point for any shopping intent |
 | `get_product_details` | Full attributes + all size variants and stock for one product |
 | `check_stock` | Checks a specific size/quantity is available and suggests in-stock alternative sizes if not |
-| `create_order` | Holds selected size variants for 15 minutes, auto-applies discounts, creates a pending order |
-| `confirm_payment` | Finalizes the order after payment, converts held stock into a real stock deduction |
+| `create_order` | Holds selected size variants for 15 minutes, resolves/creates a **guest customer by email** (no login needed), applies discounts, and generates a **Razorpay payment link** |
+| `confirm_payment` | Manual override only — see [Payments & checkout flow](#payments--checkout-flow) below |
+
+## Payments & checkout flow
+
+This is a **guest checkout**, not a login-gated one — an email address is all
+`create_order` needs to identify (or create) the shopper. There's no
+password, no OTP, no Supabase Auth account required.
+
+1. `create_order` looks up (or creates) a row in `customers` by
+   `customer_email`, holds the requested stock for 15 minutes, applies any
+   discount, then calls the **Razorpay Payment Links API** and stores the
+   resulting `payment_link_id` / `payment_link_url` on the order.
+2. The tool returns that `payment_link` to the assistant — hand it straight
+   to the shopper.
+3. The shopper pays on Razorpay's own hosted page (no card details ever pass
+   through this server or the assistant).
+4. Razorpay sends a `payment_link.paid` webhook to
+   `POST /webhooks/razorpay`. The server verifies the `X-Razorpay-Signature`
+   header against `RAZORPAY_WEBHOOK_SECRET`, then calls the same
+   `fulfillOrder()` logic the `confirm_payment` tool uses — marking the order
+   `confirmed` and converting the held stock into a real deduction.
+
+**`confirm_payment` is not part of the normal flow.** It exists for two
+situations only: local development when you don't have a public URL for
+Razorpay to send webhooks to, and manually reconciling a payment whose
+webhook delivery failed. In both cases you pass the Razorpay payment id
+(`pay_...`) you can find in the Razorpay Dashboard for that transaction.
+
+### Setting up Razorpay
+
+1. Create a Razorpay account and grab your **Key ID** / **Key Secret** from
+   Dashboard → Settings → API Keys. Put them in `.env` as `RAZORPAY_KEY_ID`
+   / `RAZORPAY_KEY_SECRET` (use the `rzp_test_` pair while developing).
+2. Deploy the server (or use a tunnel like `ngrok` for local dev) so it has
+   a public URL.
+3. In Razorpay Dashboard → Settings → Webhooks, add a webhook pointing at
+   `https://your-domain.com/webhooks/razorpay`, subscribe it to the
+   **`payment_link.paid`** event, and set a secret. Put that same secret in
+   `.env` as `RAZORPAY_WEBHOOK_SECRET`.
+4. That's it — `create_order` will now hand back a real, payable link, and
+   payments will confirm themselves.
 
 ## Seeded catalog
 
@@ -89,7 +132,8 @@ listings at time of writing — swap in a live catalog sync before production
 ```bash
 npm install
 cp .env.example .env
-# fill in SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from your Supabase project
+# fill in SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY, and
+# RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET (see below)
 
 # push schema to your Supabase project (via Supabase SQL editor, or CLI)
 # 1. run supabase/schema.sql
