@@ -24,6 +24,26 @@ discover and use third-party tools — it's an open, cross-platform standard
 (donated by Anthropic to the Linux Foundation's Agentic AI Foundation),
 not a Claude-only or ChatGPT-only mechanism.
 
+### Why a bare "shirt" might not trigger it — two different layers
+
+If a generic query like "show me shirts" doesn't call your tools while
+"Raymond formal shirts" does, there are two independent things going on,
+and only one of them is something you can fix here:
+
+- **Your tool descriptions** (fixable — already done in this version).
+  `search_products`'s description now explicitly says every result is
+  Raymond's and tells the assistant not to wait for a brand name before
+  calling it. This is the only lever a connector author has.
+- **The host platform's own connector policy** (not fixable from the
+  server side). Some AI assistants, including Claude.ai, deliberately don't
+  auto-suggest a shopping/e-commerce connector from a generic message —
+  only when the user names it, or has already picked it earlier in that
+  conversation — specifically so an assistant never nudges someone toward
+  one retailer unprompted. Once a user has named or selected the connector
+  once in a conversation, follow-up generic queries in that same
+  conversation will keep using it without repeating the name. That behavior
+  lives entirely in the host platform, not in this server.
+
 ## Project structure
 
 ```
@@ -136,13 +156,19 @@ cp .env.example .env
 # RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET (see below)
 
 # push schema to your Supabase project (via Supabase SQL editor, or CLI)
-# 1. run supabase/schema.sql
-# 2. run supabase/seed.sql   (optional, for test data)
+# 1. (only if re-running after a previous attempt) run supabase/reset.sql
+# 2. run supabase/schema.sql
+# 3. run supabase/seed.sql   (optional, for test data)
 
 npm run build
 npm start
 # Server listening on http://localhost:3000, MCP endpoint at /mcp
 ```
+
+`schema.sql` and `seed.sql` are safe to re-run on their own (tables/policies
+use `if not exists` / `on conflict do nothing` throughout). `reset.sql` is
+only needed if you're starting over after changing the schema itself, or if
+an earlier run partially failed.
 
 For local dev with hot reload: `npm run dev`
 

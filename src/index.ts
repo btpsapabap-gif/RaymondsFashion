@@ -32,8 +32,10 @@ function buildServer() {
     "browse_categories",
     "List all Raymond fashion collections available to shop (Formal Shirts, Casual Shirts, " +
       "Trousers & Chinos, T-Shirt & Polos, Jeans, Suits & Blazers, Shorts, Sweaters & Sweatshirts, " +
-      "Jackets, Sleepwear). Call this when a user wants an overview of what's available or isn't sure " +
-      "which category their need falls under.",
+      "Jackets, Sleepwear). Call this when a user wants an overview of what's available, or isn't sure " +
+      "which category their need falls under. This is the ONLY catalog behind this server — every item is " +
+      "Raymond's, so a plain 'what do you have?' or 'show me your categories' also calls this, no brand " +
+      "name needed.",
     browseCategoriesSchema,
     async (args) => ({ content: [{ type: "text", text: JSON.stringify(await browseCategories(args)) }] })
   );
@@ -41,8 +43,10 @@ function buildServer() {
   server.tool(
     "search_products",
     "Search the Raymond catalog for products by free-text query, category, color, size, price range, " +
-      "or brand. Use this FIRST whenever a user expresses intent to shop, e.g. 'show me formal shirts', " +
-      "'I need a blazer for a wedding', or 'blue jeans under 2000 rupees'.",
+      "or brand. Call this for ANY men's apparel shopping intent, generic or specific — 'show me shirts', " +
+      "'I need jeans', 'a blazer for a wedding', 'blue jeans under 2000 rupees', 'something warm for " +
+      "winter'. Every product this tool returns is Raymond's, so do NOT wait for the word 'Raymond' (or " +
+      "any brand name) before calling it — a bare 'shirt' or 'jeans' is enough intent on its own.",
     searchProductsSchema,
     async (args) => ({ content: [{ type: "text", text: JSON.stringify(await searchProducts(args)) }] })
   );
